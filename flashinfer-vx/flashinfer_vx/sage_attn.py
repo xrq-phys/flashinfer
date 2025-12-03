@@ -18,27 +18,12 @@ from typing import Optional
 import torch
 
 from flashinfer_vx import sage_quant
+from flashinfer_vx.kernel_lib import FmhaKernelLib
 
 
-class _FlashInferVxCubin:
-    kernel_store = None
-    runner_module = None
+# Lazy class
+_kernel_lib = FmhaKernelLib()
 
-    @classmethod
-    def load_module_lazy(cls):
-        "Lazy-loading for the runner module"
-        if _FlashInferVxCubin.runner_module is None:
-            import flashinfer_vx.flashinfer_vx_cubin
-            _FlashInferVxCubin.runner_module = flashinfer_vx.flashinfer_vx_cubin
-        return _FlashInferVxCubin.runner_module
-
-    @classmethod
-    def load_kernels_lazy(cls):
-        "Lazy-loading for the cubin kernels to the driver"
-        runner_module = _FlashInferVxCubin.load_module_lazy()
-        if _FlashInferVxCubin.kernel_store is None:
-            _FlashInferVxCubin.kernel_store = runner_module.load_kernels()
-        return _FlashInferVxCubin.kernel_store
 
 def _check_attn_input(Q: torch.Tensor,
                       K: torch.Tensor,
@@ -75,10 +60,7 @@ def qattn(Q: torch.Tensor,
     scaleSoftmaxLog2 = torch.empty(0, dtype=torch.float32, device=Q.device)
     outScale = torch.empty(0, dtype=torch.float32, device=Q.device)
 
-    module = _FlashInferVxCubin()
-
-    out, _, _ = module.load_module_lazy().run_context_attn(
-        module.load_kernels_lazy(),
+    out, _, _ = _kernel_lib(
         Q.to(torch.float8_e4m3fn),
         K.to(torch.float8_e4m3fn),
         V.to(torch.float8_e4m3fn),
@@ -128,10 +110,7 @@ def sageattn(Q: torch.Tensor,
     SfK = SfK.flatten(0, 1)
     SfP = torch.empty(0)
 
-    module = _FlashInferVxCubin()
-
-    out, _, _ = module.load_module_lazy().run_context_attn(
-        module.load_kernels_lazy(),
+    out, _, _ = _kernel_lib(
         QFp8,
         KFp8,
         VFp8,

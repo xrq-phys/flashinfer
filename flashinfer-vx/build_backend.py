@@ -2,18 +2,46 @@
 Custom build backend that compiles the attached cubins to a runner library.
 """
 
-import glob
 import os
 import shutil
-import sys
-import tempfile
+import subprocess
 import distutils.ccompiler
 import distutils.sysconfig
 from pathlib import Path
-from torch.utils.cpp_extension import load as load_extension
 from setuptools import build_meta as _orig
+import tvm_ffi as ffi
 import setuptools
 
+
+def _find_cuda_home():
+    """Find CUDA installation directory."""
+    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+    if cuda_home:
+        return Path(cuda_home)
+
+    # Try common locations
+    common_paths = [
+        '/usr/local/cuda',
+        '/usr/lib/cuda',
+        '/opt/cuda',
+    ]
+    for path in common_paths:
+        if Path(path).exists():
+            return Path(path)
+
+    # Try to find nvcc in PATH
+    try:
+        nvcc_path = subprocess.check_output(['which', 'nvcc'], text=True).strip()
+        return Path(nvcc_path).parent.parent
+    except:
+        pass
+
+    raise RuntimeError("Could not find CUDA installation. Please set CUDA_HOME environment variable.")
+
+def _find_python_include():
+    """Find Python include directory."""
+    import sysconfig
+    return sysconfig.get_path('include')
 
 def _cpp_compiler():
     """Get the C++ compiler to use."""
@@ -29,52 +57,96 @@ def _cpp_compiler():
 def _compile_extension():
     """Compile the CUDA extension and return the path to the compiled .so file."""
     backend_dir = Path(__file__).parent
+    tvm_ffi_dir = Path(ffi.__file__).parent
 
     # Get C++ compiler
     cxx = _cpp_compiler()
 
+    # Find CUDA
+    cuda_home = _find_cuda_home()
+    nvcc = cuda_home / 'bin' / 'nvcc'
+    if not nvcc.exists():
+        raise RuntimeError(f"nvcc not found at {nvcc}")
+
     # Define sources
-    sources = [
-        str(backend_dir / 'cpp' / 'fmhaRunner.cu'),
-        str(backend_dir / 'cpp' / 'sequencePreproc.cu')
-    ] + glob.glob(str(backend_dir / 'cubin' / '*_cubin.cpp'))
+    cu_sources = [
+        backend_dir / 'cpp' / 'fmhaRunner.cu',
+        backend_dir / 'cpp' / 'sequencePreproc.cu'
+    ]
+    cpp_sources = list((backend_dir / 'cubin').glob('*_cubin.cpp'))
 
-    # Compiler flags
-    cflags = ['-std=c++20', '-fPIC', '-O3']
-    cuflags = ['-std=c++20', '-ccbin', f'{cxx}', '-Xcompiler', '-fPIC', '-O3']
-
-    # Include directories (relative to backend_dir)
+    # Include directories
     include_dirs = [
         str(backend_dir),
         str(backend_dir / 'cubin'),
         str(backend_dir.parent / 'include'),
         str(backend_dir.parent / '3rdparty' / 'cutlass' / 'include'),
         str(backend_dir.parent / '3rdparty' / 'spdlog' / 'include'),
+        str(tvm_ffi_dir / "include"),
+        str(cuda_home / 'include'),
+        _find_python_include(),
     ]
 
     # Build dir
     build_dir = backend_dir / 'build' / 'cpp'
-    build_dir.mkdir(exist_ok=True)
+    build_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build the extension
-    load_extension(
-        name='flashinfer_vx_cubin',
-        sources=sources,
-        extra_cflags=cflags,
-        extra_cuda_cflags=cuflags,
-        extra_ldflags=['-lcuda'],
-        extra_include_paths=include_dirs,
-        build_directory=str(build_dir),
-        verbose=True,
-        with_cuda=True,
-    )
+    # Compiler flags
+    cxx_flags = ['-std=c++20', '-fPIC', '-O3']
+    nvcc_flags = [
+        '-std=c++20',
+        f'-ccbin={cxx}',
+        '--compiler-options', '-fPIC',
+        '-O3',
+        '--extended-lambda',
+        '--expt-relaxed-constexpr',
+    ]
 
-    # Find the build product
-    so_files = list(build_dir.glob('flashinfer_vx_cubin*.so'))
-    if not so_files:
-        raise RuntimeError("Failed to find compiled .so file")
+    # Add include directories to flags
+    include_flags = [f'-I{inc}' for inc in include_dirs]
 
-    return so_files[0]
+    # Object files
+    object_files = []
+
+    # Compile .cu files with nvcc
+    for cu_file in cu_sources:
+        obj_file = build_dir / (cu_file.stem + '.o')
+        cmd = [
+            str(nvcc),
+            '-c',
+            str(cu_file),
+            '-o', str(obj_file),
+        ] + nvcc_flags + include_flags
+
+        subprocess.check_call(cmd, cwd=str(backend_dir))
+        object_files.append(obj_file)
+
+    # Compile .cpp files with g++
+    for cpp_file in cpp_sources:
+        obj_file = build_dir / (cpp_file.stem + '.o')
+        cmd = [
+            cxx,
+            '-c',
+            str(cpp_file),
+            '-o', str(obj_file),
+        ] + cxx_flags + include_flags
+
+        subprocess.check_call(cmd, cwd=str(backend_dir))
+        object_files.append(obj_file)
+
+    # Link into shared library
+    so_file = build_dir / 'flashinfer_vx_cubin.so'
+    link_cmd = [cxx, '-shared', '-o', str(so_file)]
+    link_cmd += [str(obj) for obj in object_files]
+    link_cmd += [str(tvm_ffi_dir) / 'lib' / 'libtvm_ffi.so']
+    link_cmd += [f'-L{cuda_home}/lib64', '-lcuda', '-lcudart']
+
+    subprocess.check_call(link_cmd, cwd=str(backend_dir))
+
+    if not so_file.exists():
+        raise RuntimeError(f"Failed to create {so_file}")
+
+    return so_file
 
 
 def _install_extension():

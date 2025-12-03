@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "torchCommon.hpp"
+#include "tvmFfiUtils.h"
 #include "flashInferMetaInfoVx.h"
 #include "flashinfer/trtllm/fmha/fmhaRunnerParams.h"
 #include "flashinfer/logging.h"
@@ -32,6 +32,10 @@
 #include <cuda_runtime.h>
 
 
+namespace flashinfer_vx {
+
+namespace impl {
+
 class FmhaKernelStore {
   /// TODO: Use mDriver from TRTLLM
   struct KernelFunc {
@@ -45,18 +49,19 @@ class FmhaKernelStore {
   static bool initialized;
 
   static
-  Data_type convert_dtype_to_tllm(caffe2::TypeMeta dtype) {
+  Data_type convert_dtype_to_tllm(DLDataType dtype) {
     using namespace tensorrt_llm::kernels;
-    if (dtype == torch::kFloat32) {
+    uint32_t dtype_code = std::bit_cast<uint32_t>(dtype);
+    if (dtype_code == DL_FP32_CODE) {
       return DATA_TYPE_FP32;
     }
-    else if (dtype == torch::kFloat16) {
+    else if (dtype_code == DL_FP16_CODE) {
       return DATA_TYPE_FP16;
     }
-    else if (dtype == torch::kBFloat16) {
+    else if (dtype_code == DL_BF16_CODE) {
       return DATA_TYPE_BF16;
     }
-    else if (dtype == torch::kFloat8_e4m3fn || dtype == torch::kFloat8_e4m3fnuz) {
+    else if (dtype_code == DL_E4M3_CODE) {
       return DATA_TYPE_E4M3;
     }
     else {
@@ -72,9 +77,9 @@ public:
 
   FmhaKernelItem find_kernel(
     TllmGenFmhaRunnerParams const &options,
-    caffe2::TypeMeta dtypeQ,
-    caffe2::TypeMeta dtypeKv,
-    caffe2::TypeMeta dtypeO,
+    DLDataType dtypeQ,
+    DLDataType dtypeKv,
+    DLDataType dtypeO,
     int numEltsPerSageAttnBlkQ,
     int numEltsPerSageAttnBlkK,
     int numEltsPerSageAttnBlkP,
@@ -126,9 +131,9 @@ public:
     using namespace tensorrt_llm::kernels;
 
     // Obtain SM version for current device
-    c10::DeviceIndex deviceIndex;
+    int deviceIndex;
     cudaDeviceProp deviceProps;
-    c10::cuda::GetDevice(&deviceIndex);
+    FLASHINFER_CUDA_RUNTIME_CALL(cudaGetDevice(&deviceIndex));
     FLASHINFER_CUDA_RUNTIME_CALL(cudaGetDeviceProperties(&deviceProps, deviceIndex));
     int32_t smVer = deviceProps.major * 10 + deviceProps.minor;
 
@@ -168,50 +173,47 @@ public:
 bool FmhaKernelStore::initialized = false;
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_context_attn(
+void run_context_attn(
   FmhaKernelStore const &kernelStore,
-  torch::Tensor Qtensor,
-  torch::Tensor Ktensor,
-  torch::Tensor Vtensor,
-  torch::Tensor seqLensQ,
-  torch::Tensor seqLensKv,
-  torch::Tensor scaleSoftmaxLog2,
-  torch::Tensor outputScale,
-  torch::Tensor sageAttnSfQ,
-  torch::Tensor sageAttnSfK,
-  torch::Tensor sageAttnSfP,
-  torch::Tensor sageAttnSfV,
+  TensorView Otensor,
+  TensorView Qtensor,
+  TensorView Ktensor,
+  TensorView Vtensor,
+  TensorView seqLensQ,
+  TensorView seqLensKv,
+  TensorView scaleSoftmaxLog2,
+  TensorView outputScale,
+  TensorView sageAttnSfQ,
+  TensorView sageAttnSfK,
+  TensorView sageAttnSfP,
+  TensorView sageAttnSfV,
   unsigned numToksPerSageAttnBlkQ,
   unsigned numToksPerSageAttnBlkK,
   unsigned numToksPerSageAttnBlkP,
   unsigned numToksPerSageAttnBlkV,
   float scaleQ,
   bool persistentScheduler,
-  bool debugSetup
+  cudaStream_t stream
 ) {
   // Debug logging
   char logMessage[512];
   #define TLLM_LOG_DEBUG(...) { snprintf(logMessage, sizeof(logMessage), __VA_ARGS__); FLASHINFER_LOG_DEBUG(logMessage); }
-  if (debugSetup) {
-    spdlog::set_level(spdlog::level::debug);
-  } else {
-    spdlog::set_level(spdlog::level::info);
-  }
-
-  // CUDA stream
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
   // Storage type
   CHECK_CUDA(Qtensor);
   CHECK_CUDA(Ktensor);
   CHECK_CUDA(Vtensor);
+  CHECK_CUDA(Otensor);
 
   // Check input sizes
-  TORCH_CHECK_EQ(Qtensor.size(3), Ktensor.size(3)); // headDimQk
-  TORCH_CHECK_EQ(Ktensor.size(2), Vtensor.size(2)); // numHeadsKv
-  TORCH_CHECK_EQ(Ktensor.size(0), Qtensor.size(0)); // batchSize
-  TORCH_CHECK_EQ(Ktensor.size(0), Vtensor.size(0)); // batchSize
-  TORCH_CHECK_EQ(Ktensor.size(1), Vtensor.size(1)); // maxSeqLenKv
+  TVM_FFI_ICHECK_EQ(Qtensor.size(3), Ktensor.size(3)) << "headDimQk mismatch";
+  TVM_FFI_ICHECK_EQ(Vtensor.size(3), Otensor.size(3)) << "headDimV mismatch";
+  TVM_FFI_ICHECK_EQ(Qtensor.size(2), Otensor.size(2)) << "numHeadsQ mismatch";
+  TVM_FFI_ICHECK_EQ(Ktensor.size(2), Vtensor.size(2)) << "numHeadsKv mismatch";
+  TVM_FFI_ICHECK_EQ(Ktensor.size(0), Qtensor.size(0)) << "batchSize mismatch (K vs Q)";
+  TVM_FFI_ICHECK_EQ(Ktensor.size(0), Vtensor.size(0)) << "batchSize mismatch (K vs V)";
+  TVM_FFI_ICHECK_EQ(Ktensor.size(0), Otensor.size(0)) << "batchSize mismatch (K vs O)";
+  TVM_FFI_ICHECK_EQ(Ktensor.size(1), Vtensor.size(1)) << "maxSeqLenKv mismatch";
 
   // Tensor sizes
   int headDimQk   = Qtensor.size(3);
@@ -223,36 +225,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_context_attn(
   int maxSeqLenKv = Ktensor.size(1);
   int numHeadsQPerKv = numHeadsQ / numHeadsKv; // GQA?
 
-  // Output datatype
-  auto outputDtype = Qtensor.dtype();
-  if (outputDtype == torch::kFloat8_e4m3fn && outputScale.numel() < 1) {
-    outputDtype = torch::kBFloat16;
-  }
-
-  // Alloc output buffers
   /// TODO: Add softmaxMax/Sum
-  auto tensorDevice = Qtensor.device();
-  torch::Tensor Otensor;
-  if (debugSetup) {
-    Otensor = at::zeros({batchSize, maxSeqLenQ, numHeadsQ, headDimV}, torch::TensorOptions().dtype(outputDtype).device(tensorDevice));
-  } else {
-    Otensor = at::empty({batchSize, maxSeqLenQ, numHeadsQ, headDimV}, torch::TensorOptions().dtype(outputDtype).device(tensorDevice));
-  }
 
   // Preprocess sequence
-  auto seqTensorOpts = torch::TensorOptions().dtype(torch::kInt32).device(tensorDevice);
-  int constSeqKv = seqLensKv.data_ptr() == nullptr;
+  int* cumSeqLensQPtr;
+  int* cumSeqLensKvPtr;
+  int* seqLensQPtr = static_cast<int*>(seqLensQ.data_ptr());
+  int* seqLensKvPtr = seqLensKv.numel() > 0 ? static_cast<int*>(seqLensKv.data_ptr()) : nullptr;
+  int constSeqKv = seqLensKvPtr == nullptr;
   if (constSeqKv) {
-    seqLensKv = at::empty({batchSize}, seqTensorOpts);
+    FLASHINFER_CUDA_RUNTIME_CALL(cudaMalloc(&seqLensKvPtr, batchSize * sizeof(int)));
   }
-  torch::Tensor cumSeqLensQ = at::empty({batchSize + 1}, seqTensorOpts);
-  torch::Tensor cumSeqLensKv = at::empty({batchSize + 1}, seqTensorOpts);
+  FLASHINFER_CUDA_RUNTIME_CALL(cudaMalloc(&cumSeqLensQPtr, (batchSize + 1) * sizeof(int)));
+  FLASHINFER_CUDA_RUNTIME_CALL(cudaMalloc(&cumSeqLensKvPtr, (batchSize + 1) * sizeof(int)));
   int sumOfSeqLensQ = 0, sumOfSeqLensKv = 0;
   /// FIXME: Verify: Is this filling consistent with varlen?
   FLASHINFER_CUDA_RUNTIME_CALL(sequencePreprocess(
       batchSize, maxSeqLenQ, maxSeqLenKv, constSeqKv,
-      seqLensQ.data_ptr<int>(), seqLensKv.data_ptr<int>(),
-      cumSeqLensQ.data_ptr<int>(), cumSeqLensKv.data_ptr<int>(),
+      seqLensQPtr, seqLensKvPtr, cumSeqLensQPtr, cumSeqLensKvPtr,
       &sumOfSeqLensQ, &sumOfSeqLensKv, stream));
 
   // Options
@@ -301,17 +291,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_context_attn(
   options.qPtr = Qtensor.data_ptr();
   options.kPtr = Ktensor.data_ptr();
   options.vPtr = Vtensor.data_ptr();
-  options.seqLensKvPtr = seqLensKv.numel() > 0 ? seqLensKv.data_ptr<int>() : nullptr;
-  options.cumSeqLensQPtr = cumSeqLensQ.numel() > 0 ? cumSeqLensQ.data_ptr<int>() : nullptr;
-  options.cumSeqLensKvPtr = cumSeqLensKv.numel() > 0 ? cumSeqLensKv.data_ptr<int>() : nullptr;
-  options.scaleSoftmaxLog2Ptr = scaleSoftmaxLog2.numel() > 0 ? scaleSoftmaxLog2.data_ptr<float>() : nullptr;
-  options.outputScalePtr = outputScale.numel() > 0 ? outputScale.data_ptr<float>() : nullptr;
+  options.seqLensKvPtr = seqLensKvPtr;
+  options.cumSeqLensQPtr = cumSeqLensQPtr;
+  options.cumSeqLensKvPtr = cumSeqLensKvPtr;
+  options.scaleSoftmaxLog2Ptr = scaleSoftmaxLog2.numel() > 0 ? static_cast<float*>(scaleSoftmaxLog2.data_ptr()) : nullptr;
+  options.outputScalePtr = outputScale.numel() > 0 ? static_cast<float*>(outputScale.data_ptr()) : nullptr;
   options.oPtr = Otensor.data_ptr();
 
   // Device props
-  c10::DeviceIndex deviceIndex;
+  int deviceIndex;
   cudaDeviceProp deviceProps;
-  c10::cuda::GetDevice(&deviceIndex);
+  FLASHINFER_CUDA_RUNTIME_CALL(cudaGetDevice(&deviceIndex));
   FLASHINFER_CUDA_RUNTIME_CALL(cudaGetDeviceProperties(&deviceProps, deviceIndex));
   options.mMultiProcessorCount = deviceProps.multiProcessorCount;
   options.stream = stream;
@@ -319,7 +309,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_context_attn(
   // Find the kernel.
   auto kernelStoreItem = kernelStore.find_kernel(
     options,
-    Qtensor.dtype(), Ktensor.dtype(), outputDtype,
+    Qtensor.dtype(), Ktensor.dtype(), Otensor.dtype(),
     numToksPerSageAttnBlkQ,
     numToksPerSageAttnBlkK,
     numToksPerSageAttnBlkP,
@@ -383,22 +373,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_context_attn(
     /// TODO: Perform size check
     CHECK_CUDA(sageAttnSfQ);
     kernelParams.mLogNumEltsPerSageAttnBlkQ = std::bit_width(numToksPerSageAttnBlkQ) - 1;
-    kernelParams.ptrSageAttnSfsQ = sageAttnSfQ.data_ptr<float>();
+    kernelParams.ptrSageAttnSfsQ = static_cast<float*>(sageAttnSfQ.data_ptr());
   }
   if (numToksPerSageAttnBlkK > 0) {
     CHECK_CUDA(sageAttnSfK);
     kernelParams.mLogNumEltsPerSageAttnBlkK = std::bit_width(numToksPerSageAttnBlkK) - 1;
-    kernelParams.ptrSageAttnSfsK = sageAttnSfK.data_ptr<float>();
+    kernelParams.ptrSageAttnSfsK = static_cast<float*>(sageAttnSfK.data_ptr());
   }
   if (numToksPerSageAttnBlkP > 0) {
     CHECK_CUDA(sageAttnSfP);
     kernelParams.mLogNumEltsPerSageAttnBlkP = std::bit_width(numToksPerSageAttnBlkP) - 1;
-    kernelParams.ptrSageAttnSfsP = sageAttnSfP.data_ptr<float>();
+    kernelParams.ptrSageAttnSfsP = static_cast<float*>(sageAttnSfP.data_ptr());
   }
   if (numToksPerSageAttnBlkV > 0) {
     CHECK_CUDA(sageAttnSfV);
     kernelParams.mLogNumEltsPerSageAttnBlkV = std::bit_width(numToksPerSageAttnBlkV) - 1;
-    kernelParams.ptrSageAttnSfsV = sageAttnSfV.data_ptr<float>();
+    kernelParams.ptrSageAttnSfsV = static_cast<float*>(sageAttnSfV.data_ptr());
   }
 
   // Prepare kernel parameters list for cuLaunchKernelEx.
@@ -440,12 +430,71 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_context_attn(
   // Launch the kernel
   FLASHINFER_CUDA_DRIVER_CALL(cuLaunchKernelEx(&launch_config, kernelStoreItem.mFunc, kernelParamsList, nullptr));
 
-  return std::make_tuple(Otensor, at::empty({0}), at::empty({0}));
+  /// FIXME: Is it save to dealloc?
+  if (constSeqKv) {
+    FLASHINFER_CUDA_RUNTIME_CALL(cudaFree(seqLensKvPtr));
+  }
+  FLASHINFER_CUDA_RUNTIME_CALL(cudaFree(cumSeqLensQPtr));
+  FLASHINFER_CUDA_RUNTIME_CALL(cudaFree(cumSeqLensKvPtr));
 }
 
+} // impl
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  py::class_<FmhaKernelStore>(m, "FmhaKernelStore", py::module_local());
-  m.def("run_context_attn", &run_context_attn, "Run context attention");
-  m.def("load_kernels", []() { return std::make_unique<FmhaKernelStore>(); }, "Load all kernels from the embedded cubin");
+int64_t load_kernels() {
+  using namespace flashinfer_vx::impl;
+  auto* kernel_store = new FmhaKernelStore();
+  return reinterpret_cast<int64_t>(kernel_store);
 }
+
+void unload_kernels(int64_t kernel_store_handle) {
+  using namespace flashinfer_vx::impl;
+  auto* kernel_store = reinterpret_cast<FmhaKernelStore*>(kernel_store_handle);
+  delete kernel_store;
+}
+
+void run_context_attn(
+  int64_t kernel_store_handle,
+  TensorView Otensor,
+  TensorView Qtensor,
+  TensorView Ktensor,
+  TensorView Vtensor,
+  TensorView seqLensQ,
+  TensorView seqLensKv,
+  TensorView scaleSoftmaxLog2,
+  TensorView outputScale,
+  TensorView sageAttnSfQ,
+  TensorView sageAttnSfK,
+  TensorView sageAttnSfP,
+  TensorView sageAttnSfV,
+  int64_t numToksPerSageAttnBlkQ,
+  int64_t numToksPerSageAttnBlkK,
+  int64_t numToksPerSageAttnBlkP,
+  int64_t numToksPerSageAttnBlkV,
+  double scaleQ,
+  bool persistentScheduler,
+  int64_t stream
+) {
+  using namespace flashinfer_vx::impl;
+  auto* kernel_store = reinterpret_cast<FmhaKernelStore*>(kernel_store_handle);
+
+  run_context_attn(
+    *kernel_store,
+    Otensor, Qtensor, Ktensor, Vtensor,
+    seqLensQ, seqLensKv,
+    scaleSoftmaxLog2, outputScale,
+    sageAttnSfQ, sageAttnSfK, sageAttnSfP, sageAttnSfV,
+    static_cast<unsigned>(numToksPerSageAttnBlkQ),
+    static_cast<unsigned>(numToksPerSageAttnBlkK),
+    static_cast<unsigned>(numToksPerSageAttnBlkP),
+    static_cast<unsigned>(numToksPerSageAttnBlkV),
+    static_cast<float>(scaleQ),
+    persistentScheduler,
+    reinterpret_cast<cudaStream_t>(stream)
+  );
+}
+
+}  // namespace flashinfer_vx
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_vx_load_kernels, flashinfer_vx::load_kernels);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_vx_unload_kernels, flashinfer_vx::unload_kernels);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_vx_run_context_attn, flashinfer_vx::run_context_attn);
