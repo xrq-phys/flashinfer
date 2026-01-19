@@ -542,10 +542,14 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
     // for DiT, Qk has the same type while V is not. this means that we want to carry out Bmm1 in
     // dtypeQk and Bmm2 in dtypeV (Pv). currently this is done by reinterpreting from E4m3
     qk_reinterpret_type = dl_dtype_to_tllm_data_type(query.dtype());
-    // reinterpret dtypes & shapes (for TMA) related to Qk
+    // reinterpret dtypes
     q_data_type = kv_data_type;
-    head_dim_qk =
-        head_dim_qk * get_size_in_bits(qk_reinterpret_type) / get_size_in_bits(q_data_type);
+    // reinterpret shapes (for TMA) related to Qk
+    int dtype_size = get_size_in_bits(qk_reinterpret_type) / get_size_in_bits(q_data_type);
+    head_dim_qk *= dtype_size;
+    k_stride_keys_values *= dtype_size;
+    k_stride_heads *= dtype_size;
+    k_stride_batch *= dtype_size;
   } else {
     // no reinterpret (ignored when qk_reinterpret_type == E4m3 or q_data_type != E4m3)
     qk_reinterpret_type = DATA_TYPE_E4M3;
