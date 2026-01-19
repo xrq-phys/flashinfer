@@ -247,6 +247,10 @@ class TllmGenFmhaKernel {
       auto kernelParams = KernelParams::setKernelParams(
           params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
 
+      // Prepare SageAttention parameter sections.
+      setSageAttentionParams(kernelParams, params.ptrSageAttnSfsQ, params.ptrSageAttnSfsK,
+                             params.ptrSageAttnSfsP, params.ptrSageAttnSfsV);
+
       // Prepare kernel parameters list for cuLaunchKernelEx.
       void* kernelParamsList[] = {&kernelParams};
       CUlaunchConfig launch_config;
@@ -851,6 +855,25 @@ class TllmGenFmhaKernel {
 
     // Return the function and kernelMeta.
     return std::make_pair(func, kernelMeta);
+  }
+
+  // Add SageAttention fields to a params object
+  inline void setSageAttentionParams(KernelParams& kernelParams, float const* ptrSageAttnSfsQ,
+                                     float const* ptrSageAttnSfsK, float const* ptrSageAttnSfsP,
+                                     float const* ptrSageAttnSfsV) const {
+    // When mNumEltsPerSageAttnBlk == 0, kernels are compiled not to use field
+    // kernelParams.mLogNumEltsPerSageAttnBlk. __builtin_clz(0)=(any value) is safe here.
+    auto clz = [](int x) { return x == 0 ? 0 : __builtin_clz(x); };
+    kernelParams.mLogNumEltsPerSageAttnBlkQ = 31 - clz(mNumEltsPerSageAttnBlkQ);
+    kernelParams.mLogNumEltsPerSageAttnBlkK = 31 - clz(mNumEltsPerSageAttnBlkK);
+    kernelParams.mLogNumEltsPerSageAttnBlkP = 31 - clz(mNumEltsPerSageAttnBlkP);
+    kernelParams.mLogNumEltsPerSageAttnBlkV = 31 - clz(mNumEltsPerSageAttnBlkV);
+    // Unlike other pointer objects where the kernel uses non-nullptr to judge whether to perform
+    // a certain action, SageAttention is not one of them. Populate them unconditionally.
+    kernelParams.ptrSageAttnSfsQ = ptrSageAttnSfsQ;
+    kernelParams.ptrSageAttnSfsK = ptrSageAttnSfsK;
+    kernelParams.ptrSageAttnSfsP = ptrSageAttnSfsP;
+    kernelParams.ptrSageAttnSfsV = ptrSageAttnSfsV;
   }
 
   Data_type mDtypeQ, mDtypeKv, mDtypeOut;

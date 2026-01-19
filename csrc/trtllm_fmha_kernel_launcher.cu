@@ -217,6 +217,8 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
     return Data_type::DATA_TYPE_E4M3;
   } else if (dtype == dl_float8_e5m2) {
     return Data_type::DATA_TYPE_E5M2;
+  } else if (dtype == dl_int8) {
+    return Data_type::DATA_TYPE_INT8;
   } else if (dtype == dl_uint8) {
     // fp4 tensor is not supported in torch and use uint8_t as container.
     return Data_type::DATA_TYPE_E2M1;
@@ -412,7 +414,10 @@ void trtllm_ragged_attention_launcher(
     int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl, bool is_causal,
     int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
-    Data_type qk_reinterpret_type, int64_t workspace_size, cudaStream_t stream) {
+    Data_type qk_reinterpret_type, int64_t workspace_size, float const* sage_attn_sfs_q,
+    float const* sage_attn_sfs_k, float const* sage_attn_sfs_p, float const* sage_attn_sfs_v,
+    int64_t num_elts_sage_q, int64_t num_elts_sage_k, int64_t num_elts_sage_p,
+    int64_t num_elts_sage_v, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -420,7 +425,8 @@ void trtllm_ragged_attention_launcher(
     FLASHINFER_ERROR(err_msg.str());
   }
   auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type,
-                                                 qk_reinterpret_type, 0, 0, 0, 0);
+                                                 qk_reinterpret_type, num_elts_sage_q,
+                                                 num_elts_sage_k, num_elts_sage_p, num_elts_sage_v);
   TllmGenFmhaRunnerParams runner_params;
 
   runner_params.qPtr = query;
@@ -455,6 +461,10 @@ void trtllm_ragged_attention_launcher(
   runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
   runner_params.cumSeqLensQPtr = cum_seq_lens_q;
   runner_params.ptrAttentionSinks = attention_sinks;
+  runner_params.ptrSageAttnSfsQ = sage_attn_sfs_q;
+  runner_params.ptrSageAttnSfsK = sage_attn_sfs_k;
+  runner_params.ptrSageAttnSfsP = sage_attn_sfs_p;
+  runner_params.ptrSageAttnSfsV = sage_attn_sfs_v;
   runner_params.enable_pdl = enable_pdl;
 
   runner_params.kStrideKeysValues = k_stride_keys_values;
@@ -495,14 +505,17 @@ void trtllm_ragged_attention_launcher(
   fmha_runner->run(runner_params);
 }
 
-void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, TensorView value,
-                             TensorView workspace_buffer, TensorView seq_lens, int64_t max_q_len,
-                             int64_t max_kv_len, Variant<double, ffi::Tensor> bmm1_scale,
-                             Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale,
-                             int64_t batch_size, int64_t window_left, TensorView cum_seq_lens_q,
-                             TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl,
-                             bool is_causal, int64_t workspace_size,
-                             Optional<TensorView> attention_sinks, Optional<TensorView> lse) {
+void trtllm_ragged_attention(
+    TensorView out, TensorView query, TensorView key, TensorView value, TensorView workspace_buffer,
+    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
+    double o_sf_scale, int64_t batch_size, int64_t window_left, TensorView cum_seq_lens_q,
+    TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl, bool is_causal,
+    int64_t workspace_size, Optional<TensorView> attention_sinks, Optional<TensorView> lse,
+    Optional<TensorView> sage_attn_sfs_q, Optional<TensorView> sage_attn_sfs_k,
+    Optional<TensorView> sage_attn_sfs_p, Optional<TensorView> sage_attn_sfs_v,
+    int64_t num_elts_sage_q, int64_t num_elts_sage_k, int64_t num_elts_sage_p,
+    int64_t num_elts_sage_v) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
     TVM_FFI_ICHECK_EQ(attention_sinks.value().dtype(), dl_float32)
@@ -514,6 +527,18 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
     TVM_FFI_ICHECK_EQ(lse.value().dtype(), dl_float32) << "lse must be a float tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());
   }
+  float const* sage_attn_sfs_q_ptr = sage_attn_sfs_q.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_q.value().data_ptr())
+                                         : nullptr;
+  float const* sage_attn_sfs_k_ptr = sage_attn_sfs_k.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_k.value().data_ptr())
+                                         : nullptr;
+  float const* sage_attn_sfs_p_ptr = sage_attn_sfs_p.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_p.value().data_ptr())
+                                         : nullptr;
+  float const* sage_attn_sfs_v_ptr = sage_attn_sfs_v.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_v.value().data_ptr())
+                                         : nullptr;
   TVM_FFI_ICHECK_EQ(out.ndim(), 3) << "out must be a 3D tensor";
   TVM_FFI_ICHECK_EQ(query.ndim(), 3) << "query must be a 3D tensor";
   TVM_FFI_ICHECK_EQ(key.ndim(), 3) << "key must be a 3D tensor";
@@ -582,7 +607,8 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, batch_size, window_left,
       sm_count, enable_pdl, is_causal, k_stride_keys_values, k_stride_heads, k_stride_batch,
       v_stride_keys_values, v_stride_heads, v_stride_batch, qk_reinterpret_type, workspace_size,
-      stream);
+      sage_attn_sfs_q_ptr, sage_attn_sfs_k_ptr, sage_attn_sfs_p_ptr, sage_attn_sfs_v_ptr,
+      num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v, stream);
 }
 
 namespace trtllm_cubin_loader {
