@@ -29,7 +29,7 @@
 #include "../../utils.cuh"
 #include "../common.h"
 #include "cuda_runtime_api.h"
-#include "flashInferMetaInfo.h"
+#include "fmhaKernelMetaCompat.h"
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
@@ -93,16 +93,24 @@ class TllmGenFmhaKernel {
   };
 
  public:
-  using KernelMeta = tensorrt_llm::kernels::TllmGenFmhaKernelMetaInfo;
+  using KernelMeta = flashinfer::trtllm_fmha_meta::TllmGenFmhaKernelMetaInfoCompat;
   using RunnerParams = TllmGenFmhaRunnerParams;
   using SelectKernelParams = TllmGenSelectKernelParams;
 
   // Ctor.
   TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ,
-                    Data_type dtypeKv, Data_type dtypeOut, unsigned int smArch)
+                    Data_type dtypeKv, Data_type dtypeOut, unsigned int smArch,
+                    Data_type dtypeQkReinterpret, int numEltsPerSageAttnBlkQ,
+                    int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
+                    int numEltsPerSageAttnBlkV)
       : mDtypeQ(dtypeQ),
         mDtypeKv(dtypeKv),
         mDtypeOut(dtypeOut),
+        mDtypeQkReinterpret(dtypeQkReinterpret),
+        mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ),
+        mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK),
+        mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP),
+        mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV),
         mKernelMeta(pMetaStart),
         mKernelMetaCount(nMetaCount),
         mSM(smArch) {}
@@ -112,7 +120,12 @@ class TllmGenFmhaKernel {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
-          kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut) {
+          kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut &&
+          kernelMeta.mDataTypeQkReinterpret == mDtypeQkReinterpret &&
+          kernelMeta.mNumEltsPerSageAttnBlkQ == mNumEltsPerSageAttnBlkQ &&
+          kernelMeta.mNumEltsPerSageAttnBlkK == mNumEltsPerSageAttnBlkK &&
+          kernelMeta.mNumEltsPerSageAttnBlkP == mNumEltsPerSageAttnBlkP &&
+          kernelMeta.mNumEltsPerSageAttnBlkV == mNumEltsPerSageAttnBlkV) {
         // Store metadata for later use.
         IKL_LOG_DEBUG("Adding tllmgen attention kernel %s", kernelMeta.mFuncName);
         // Check for hash conflicts.
@@ -301,7 +314,8 @@ class TllmGenFmhaKernel {
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
       // Run the separate reduction kernel if needed.
-      tensorrt_llm::kernels::runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount,
+      tensorrt_llm::kernels::runFmhaReduction(flashinfer::trtllm_fmha_meta::toLlm(kernelMeta),
+                                              kernelParams, params.mMultiProcessorCount,
                                               params.enable_pdl, params.stream);
 
       if (params.lsePtr != nullptr) {
@@ -840,6 +854,11 @@ class TllmGenFmhaKernel {
   }
 
   Data_type mDtypeQ, mDtypeKv, mDtypeOut;
+  Data_type mDtypeQkReinterpret;
+  int mNumEltsPerSageAttnBlkQ;
+  int mNumEltsPerSageAttnBlkK;
+  int mNumEltsPerSageAttnBlkP;
+  int mNumEltsPerSageAttnBlkV;
   KernelMeta const* mKernelMeta;
   unsigned int mKernelMetaCount;
   unsigned int mSM;
@@ -863,19 +882,36 @@ class TllmFmhaKernelFactory {
 
   KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList,
                                unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv,
-                               Data_type dtypeOut, unsigned int sm) {
+                               Data_type dtypeOut, unsigned int sm, Data_type dtypeQkReinterpret,
+                               int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK,
+                               int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV) {
     static std::mutex s_mutex;
     std::lock_guard<std::mutex> lg(s_mutex);
 
-    auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
+    auto const id =
+        hashID(dtypeQ, dtypeKv, dtypeOut, sm, dtypeQkReinterpret, numEltsPerSageAttnBlkQ,
+               numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
     auto const findIter = mKernels.find(id);
     if (findIter == mKernels.end()) {
-      KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
+      KernelType* newKernel = new KernelType{pKernelList,
+                                             nbKernels,
+                                             dtypeQ,
+                                             dtypeKv,
+                                             dtypeOut,
+                                             sm,
+                                             dtypeQkReinterpret,
+                                             numEltsPerSageAttnBlkQ,
+                                             numEltsPerSageAttnBlkK,
+                                             numEltsPerSageAttnBlkP,
+                                             numEltsPerSageAttnBlkV};
       newKernel->loadKernels();
       mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
       IKL_LOG_DEBUG(
-          "Loading new kernel for dtypeQ=%s, dtypeKv=%s, dtypeOut=%s, sm=%d with %d loaded kernels",
-          toStr(dtypeQ), toStr(dtypeKv), toStr(dtypeOut), sm, newKernel->getNumLoadedKernels());
+          "Loading new kernel for dtypeQ=%s, dtypeKv=%s, dtypeOut=%s, dtypeQkReinterpret=%s, "
+          "sageQ=%d, sageK=%d, sageP=%d, sageV=%d, sm=%d with %d loaded kernels",
+          toStr(dtypeQ), toStr(dtypeKv), toStr(dtypeOut), toStr(dtypeQkReinterpret),
+          numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP,
+          numEltsPerSageAttnBlkV, sm, newKernel->getNumLoadedKernels());
       return newKernel;
     }
     return findIter->second.get();
@@ -896,23 +932,42 @@ class TllmFmhaKernelFactory {
  private:
   TllmFmhaKernelFactory() = default;
 
-  inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
-                         unsigned int sm) const {
-    return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 |
-           static_cast<uint64_t>(dtypeKv) << 20 | static_cast<uint64_t>(dtypeOut) << 24;
+  // Encode mNumEltsPerSageAttnBlk as 0 for NoSage, log2(x)+1 for SageAttn
+  inline uint64_t encodeSageAttnBlk(int numElts) const {
+    if (numElts == 0) {
+      return 0;
+    }
+    FLASHINFER_CHECK((numElts & (numElts - 1)) == 0 && numElts <= 64,
+                     "mNumEltsPerSageAttnBlk must be 0 or power-of-2 <= 64.");
+    return static_cast<uint64_t>(32 - __builtin_clz(numElts));
+  }
+
+  inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm,
+                         Data_type dtypeQkReinterpret, int numEltsPerSageAttnBlkQ,
+                         int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
+                         int numEltsPerSageAttnBlkV) const {
+    uint64_t base = static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 |
+                    static_cast<uint64_t>(dtypeKv) << 20 | static_cast<uint64_t>(dtypeOut) << 24;
+    uint64_t sageAttnBits = (encodeSageAttnBlk(numEltsPerSageAttnBlkQ) << 32) |
+                            (encodeSageAttnBlk(numEltsPerSageAttnBlkK) << 35) |
+                            (encodeSageAttnBlk(numEltsPerSageAttnBlkP) << 38) |
+                            (encodeSageAttnBlk(numEltsPerSageAttnBlkV) << 41);
+    return base | sageAttnBits | (static_cast<uint64_t>(dtypeQkReinterpret) << 44);
   }
 
   std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
 };
 
-inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv,
-                                                   Data_type dtypeOut, unsigned int sm) {
+inline TllmGenFmhaKernel const* getTllmFmhaKernels(
+    Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm,
+    Data_type dtypeQkReinterpret, int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK,
+    int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV) {
 #ifndef EXCLUDE_SM_100
+  auto const& kernelMetas = flashinfer::trtllm_fmha_meta::getAllKernelMetaInfos();
   return TllmFmhaKernelFactory::Get().getKernels(
-      tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos,
-      sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos) /
-          sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos[0]),
-      dtypeQ, dtypeKv, dtypeOut, sm);
+      kernelMetas.data(), static_cast<unsigned int>(kernelMetas.size()), dtypeQ, dtypeKv, dtypeOut,
+      sm, dtypeQkReinterpret, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK,
+      numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
 #else
   return nullptr;
 #endif  // EXCLUDE_SM_100

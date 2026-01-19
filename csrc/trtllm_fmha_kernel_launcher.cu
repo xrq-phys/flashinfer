@@ -44,20 +44,26 @@ enum class TllmPagedAttentionMode {
 
 class TllmGenFmhaRunnerCache {
  public:
-  using Key = std::tuple<Data_type, Data_type, Data_type>;
+  using Key = std::tuple<Data_type, Data_type, Data_type, Data_type, int, int, int, int>;
 
   static std::shared_ptr<TllmGenFmhaRunner> get(Data_type q_data_type, Data_type kv_data_type,
-                                                Data_type o_data_type) {
+                                                Data_type o_data_type,
+                                                Data_type qk_reinterpret_type = DATA_TYPE_E4M3,
+                                                int num_elts_sage_q = 0, int num_elts_sage_k = 0,
+                                                int num_elts_sage_p = 0, int num_elts_sage_v = 0) {
     static std::unordered_map<Key, std::shared_ptr<TllmGenFmhaRunner>, KeyHash> cache;
     static std::mutex cache_mutex;
-    Key key = std::make_tuple(q_data_type, kv_data_type, o_data_type);
+    Key key = std::make_tuple(q_data_type, kv_data_type, o_data_type, qk_reinterpret_type,
+                              num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v);
 
     std::lock_guard<std::mutex> lock(cache_mutex);
     auto it = cache.find(key);
     if (it != cache.end()) {
       return it->second;
     } else {
-      auto runner = std::make_shared<TllmGenFmhaRunner>(q_data_type, kv_data_type, o_data_type);
+      auto runner = std::make_shared<TllmGenFmhaRunner>(
+          q_data_type, kv_data_type, o_data_type, qk_reinterpret_type, num_elts_sage_q,
+          num_elts_sage_k, num_elts_sage_p, num_elts_sage_v);
       cache.emplace(key, runner);
       return runner;
     }
@@ -68,7 +74,10 @@ class TllmGenFmhaRunnerCache {
     std::size_t operator()(const Key& k) const {
       return std::hash<int>()(static_cast<int>(std::get<0>(k))) ^
              (std::hash<int>()(static_cast<int>(std::get<1>(k))) << 1) ^
-             (std::hash<int>()(static_cast<int>(std::get<2>(k))) << 2);
+             (std::hash<int>()(static_cast<int>(std::get<2>(k))) << 2) ^
+             (std::hash<int>()(static_cast<int>(std::get<3>(k))) << 3) ^
+             (std::hash<int>()(std::get<4>(k)) << 4) ^ (std::hash<int>()(std::get<5>(k)) << 5) ^
+             (std::hash<int>()(std::get<6>(k)) << 6) ^ (std::hash<int>()(std::get<7>(k)) << 7);
     }
   };
 };
@@ -403,14 +412,15 @@ void trtllm_ragged_attention_launcher(
     int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl, bool is_causal,
     int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
-    int64_t workspace_size, cudaStream_t stream) {
+    Data_type qk_reinterpret_type, int64_t workspace_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
             << " and num_qo_heads: " << num_qo_heads;
     FLASHINFER_ERROR(err_msg.str());
   }
-  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
+  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type,
+                                                 qk_reinterpret_type, 0, 0, 0, 0);
   TllmGenFmhaRunnerParams runner_params;
 
   runner_params.qPtr = query;
@@ -510,7 +520,7 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
   TVM_FFI_ICHECK_EQ(value.ndim(), 3) << "value must be a 3D tensor";
 
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
-  auto kv_data_type = dl_dtype_to_tllm_data_type(key.dtype());
+  auto kv_data_type = dl_dtype_to_tllm_data_type(value.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
   const auto stream = get_stream(query.device());
   int num_qo_heads = query.size(1);
@@ -526,6 +536,20 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
   int v_stride_heads = value.stride(1);
   int v_stride_batch = value.numel();
 
+  Data_type qk_reinterpret_type;
+  if (query.dtype() == key.dtype() && key.dtype() != value.dtype() &&
+      kv_data_type == DATA_TYPE_E4M3) {
+    // for DiT, Qk has the same type while V is not. this means that we want to carry out Bmm1 in
+    // dtypeQk and Bmm2 in dtypeV (Pv). currently this is done by reinterpreting from E4m3
+    qk_reinterpret_type = dl_dtype_to_tllm_data_type(query.dtype());
+    // reinterpret dtypes & shapes (for TMA) related to Qk
+    q_data_type = kv_data_type;
+    head_dim_qk =
+        head_dim_qk * get_size_in_bits(qk_reinterpret_type) / get_size_in_bits(q_data_type);
+  } else {
+    // no reinterpret (ignored when qk_reinterpret_type == E4m3 or q_data_type != E4m3)
+    qk_reinterpret_type = DATA_TYPE_E4M3;
+  }
   auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
   auto maybe_bmm2_scale_value = bmm2_scale.as<double>();
   auto maybe_bmm1_scale_log2_tensor = bmm1_scale.as<ffi::Tensor>();
@@ -553,7 +577,8 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale_value,
       bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, batch_size, window_left,
       sm_count, enable_pdl, is_causal, k_stride_keys_values, k_stride_heads, k_stride_batch,
-      v_stride_keys_values, v_stride_heads, v_stride_batch, workspace_size, stream);
+      v_stride_keys_values, v_stride_heads, v_stride_batch, qk_reinterpret_type, workspace_size,
+      stream);
 }
 
 namespace trtllm_cubin_loader {
