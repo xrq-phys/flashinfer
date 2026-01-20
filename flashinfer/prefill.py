@@ -3444,7 +3444,9 @@ def trtllm_ragged_attention(
         assert bmm2_scale.dtype == torch.float32
 
     sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = sage_attn_sfs
-    num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = num_elts_per_sage_attn_blk
+    num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = (
+        num_elts_per_sage_attn_blk
+    )
 
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
@@ -3482,6 +3484,7 @@ def trtllm_ragged_attention(
         return out, lse
     else:
         return out
+
 
 @flashinfer_api
 def trtllm_ragged_attention_deepseek(
