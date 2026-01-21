@@ -20,7 +20,6 @@
 
 #include "../common.h"
 #include "flashInferMetaInfo.h"
-#include "flashInferMetaInfoVx.h"
 
 namespace flashinfer::trtllm_fmha_meta {
 struct TllmGenFmhaKernelMetaInfoCompat {

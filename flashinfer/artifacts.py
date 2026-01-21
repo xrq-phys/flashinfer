@@ -87,7 +87,7 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "7606bdf4e78ae716c44ef5704e731cf2634e002d/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "59c30c5996455742b7d5090a5383286de51a408f/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "ccae3ed120a12a2c6922b458086b460413dbf731/batched_gemm-0d275a2-9936841"
     )
@@ -107,7 +107,7 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "596510728ed87fe72687458d1c536ac14af719894631ec931948b603dd4866a6"
+        "acb9f344b6bf5c76b528a564dbfa7c6aeee5d90604f1a93e6ac400dbdfd6bd7d"
     )
     TRTLLM_GEN_BMM: str = (
         "b7689d3046493806251351c2744c6d7faed6af25518647a955b35c4919b014fc"
@@ -161,12 +161,6 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"),
         checksums[
             safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")
-        ],
-    )
-    yield (
-        safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfoVx.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfoVx.h")
         ],
     )
     yield (
