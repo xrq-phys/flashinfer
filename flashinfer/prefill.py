@@ -3331,6 +3331,162 @@ def get_trtllm_gen_fmha_module():
 
 
 @flashinfer_api
+def trtllm_ragged_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    o_sf_scale: float,
+    batch_size: int,
+    window_left: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    enable_pdl: bool,
+    is_causal: bool,
+    return_lse: bool,
+    attention_sinks: Optional[torch.Tensor] = None,
+    sage_attn_sfs: Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ] = (None, None, None, None),
+    num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim]
+    key : torch.Tensor
+        key tensor with shape [num_tokens, num_heads, head_dim]
+    value : torch.Tensor
+        value tensor with shape [num_tokens, num_heads, head_dim]
+    workspace_buffer : torch.Tensor
+        workspace buffer
+    seq_lens : torch.Tensor
+        sequence lengths
+    max_q_len : int
+        max query length
+    max_kv_len : int
+        max key/value length
+    bmm1_scale : Union[float, torch.Tensor]
+        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+    bmm2_scale : Union[float, torch.Tensor]
+        scale for bmm2, scale_v
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+    o_sf_scale : float
+        scale for output
+    batch_size : int
+        batch size
+    window_left : int
+        window left
+    cum_seq_lens_q : torch.Tensor
+        cumulative sequence lengths for query
+    cum_seq_lens_kv : torch.Tensor
+        cumulative sequence lengths for key/value
+    enable_pdl : bool
+        enable pdl
+    is_causal : bool
+        is causal
+    attention_sinks : Optional[torch.Tensor]
+        attention sinks
+    sage_attn_sfs : Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
+        SageAttention scaling-factor tensors (Q/K/P/V).
+        NOTE: these shapes will not be validated.
+    num_elts_per_sage_attn_blk : Tuple[int, int, int, int]
+        number of elements per SageAttention block for Q/K/P/V.
+    out : Optional[torch.Tensor]
+        output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
+    lse : Optional[torch.Tensor]
+        lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+
+    Returns
+    -------
+    out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or Tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
+    sm_count = get_device_sm_count(query.device)
+    if out is None:
+        out = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            value.shape[2],
+            device=query.device,
+            dtype=query.dtype,
+        )
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
+
+    sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = sage_attn_sfs
+    num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = (
+        num_elts_per_sage_attn_blk
+    )
+
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+    run_func(
+        out,
+        query,
+        key,
+        value,
+        workspace_buffer,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale,
+        batch_size,
+        window_left,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        sm_count,
+        enable_pdl,
+        is_causal,
+        workspace_size,
+        attention_sinks,
+        lse,
+        sage_attn_sfs_q,
+        sage_attn_sfs_k,
+        sage_attn_sfs_p,
+        sage_attn_sfs_v,
+        num_elts_sage_q,
+        num_elts_sage_k,
+        num_elts_sage_p,
+        num_elts_sage_v,
+    )
+    if return_lse:
+        return out, lse
+    else:
+        return out
+
+
+@flashinfer_api
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3408,36 +3564,7 @@ def trtllm_ragged_attention_deepseek(
         "currently only support deepseek r1 192 query and 128 value"
     )
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(query.device)
-
-    run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
-    sm_count = get_device_sm_count(query.device)
-    if out is None:
-        out = torch.empty(
-            query.shape[0],
-            query.shape[1],
-            value.shape[2],
-            device=query.device,
-            dtype=query.dtype,
-        )
-    if return_lse and lse is None:
-        lse = torch.empty(
-            query.shape[0],
-            query.shape[1],
-            device=query.device,
-            dtype=torch.float32,
-        )
-
-    if isinstance(bmm1_scale, torch.Tensor):
-        assert bmm1_scale.dtype == torch.float32
-        bmm1_scale = bmm1_scale * log2e
-    if isinstance(bmm2_scale, torch.Tensor):
-        assert bmm2_scale.dtype == torch.float32
-
-    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
-    run_func(
-        out,
+    return trtllm_ragged_attention(
         query,
         key,
         value,
@@ -3452,17 +3579,13 @@ def trtllm_ragged_attention_deepseek(
         window_left,
         cum_seq_lens_q,
         cum_seq_lens_kv,
-        sm_count,
         enable_pdl,
         is_causal,
-        workspace_size,
+        return_lse,
         attention_sinks,
+        out,
         lse,
     )
-    if return_lse:
-        return out, lse
-    else:
-        return out
 
 
 @flashinfer_api
