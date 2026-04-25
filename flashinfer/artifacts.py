@@ -145,7 +145,7 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
-    DSL_FMHA: str = "c770c91cb0d991b7828fc85d2253a62f0d356b6c/fmha/cute-dsl/"
+    DSL_FMHA: str = "1a57c96bfdb7ad5a1885ab17bbd94f93158e53d8/fmha/cute-dsl/"
     DSL_FMHA_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_110a")
 
 
@@ -170,14 +170,14 @@ class CheckSumHash:
     # NOT hashes of individual kernel .so files.
     DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
         "x86_64": {
-            "sm_100a": "9533536698cdc256d897fffb3114de317076654ff8630ff283d850cc3dc96d86",
-            "sm_103a": "927e1954f1d45b0ee876f139084e4facdfcc87e86f4d30cb92d5c33698d4c2d6",
-            "sm_110a": "277b1dceaab2081e3def37cf997280a3f2c3ac515d22b80be141253c0278b8b5",
+            "sm_100a": "a3e6c3aff9ae3c1d5d14f9e4fdbc15ceec9e23efffbb16467d0dcc9e6a7a50b8",
+            "sm_103a": "567742034f8e048c05cfd051e8afeaabc4739993dc2e55faccb773e903e2d98f",
+            "sm_110a": "064b6a95682ef0f847d89d8ac52eb0330d9a0a97e46096f30153ac34516b717d",
         },
         "aarch64": {
-            "sm_100a": "b48ed0bcc9bad4afd33e0784c8c9eb9e13e782afe197816b1d0747b11759493e",
-            "sm_103a": "bace619a560f3ce52ad6ba105fffb8ea8629fe57885a90892c9e15a7122467e1",
-            "sm_110a": "d8369bcfa443bfd791cd014e3b030d378f00a975db8278eebd5b2fb529e3257d",
+            "sm_100a": "68bd244779639652d3af434ed5507d11bf7cb79f56e81ad52066daaec63be4db",
+            "sm_103a": "d5385ffaed52a716f5ac8daf1b7310b4724fef4f90ebf0e69b62bd8f8f704a4a",
+            "sm_110a": "3310fc8a4a365d061856071c766c2c6df7b4fcc9bcaee01f1025fc8baba4dcf7",
         },
     }
     map_checksums: dict[str, str] = {

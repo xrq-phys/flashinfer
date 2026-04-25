@@ -119,7 +119,8 @@ def _dtype_to_str(dtype: torch.dtype) -> str:
 
 
 def _get_variant_name(
-    in_dtype: torch.dtype,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     head_dim: int,
     is_causal: bool,
@@ -130,10 +131,15 @@ def _get_variant_name(
     enable_tvm_ffi: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
-    in_str = _dtype_to_str(in_dtype)
+    qk_str = _dtype_to_str(qk_dtype)
+    pv_str = _dtype_to_str(pv_dtype)
     out_str = _dtype_to_str(out_dtype)
-    # Only include out_dtype in name when it differs from in_dtype (mixed precision)
-    dtype_str = f"{in_str}_{out_str}" if in_dtype != out_dtype else in_str
+    if qk_dtype != pv_dtype:
+        dtype_str = f"{qk_str}_{pv_str}_{out_str}"
+    elif qk_dtype != out_dtype:
+        dtype_str = f"{qk_str}_{out_str}"
+    else:
+        dtype_str = qk_str
     causal_str = "causal" if is_causal else "nocausal"
     persist_str = "persistent" if is_persistent else "nonpersistent"
     varlen_str = "_varlen" if varlen else ""
@@ -225,7 +231,8 @@ def _load_from_local(variant_name: str, local_dir: str, enable_tvm_ffi: bool = F
 @functools.cache
 def get_cute_dsl_fmha_kernel(
     gpu_arch: str,
-    in_dtype: torch.dtype,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     head_dim: int,
     is_causal: bool,
@@ -245,10 +252,12 @@ def get_cute_dsl_fmha_kernel(
     gpu_arch : str
         GPU architecture string (e.g. 'sm_100a'), used both for selecting the
         correct artifact and as part of the cache key.
-    in_dtype : torch.dtype
-        Input data type (torch.float16, torch.bfloat16, or torch.float8_e4m3fn).
+    qk_dtype : torch.dtype
+        Q/K input data type.
+    pv_dtype : torch.dtype
+        V/PV input data type.
     out_dtype : torch.dtype
-        Output data type. Same as in_dtype for non-mixed precision.
+        Output data type.
     head_dim : int
         Head dimension (e.g., 64, 128, 192). Note: 192 only supports FP8.
     is_causal : bool
@@ -269,7 +278,8 @@ def get_cute_dsl_fmha_kernel(
         The compiled kernel function.
     """
     variant_name = _get_variant_name(
-        in_dtype,
+        qk_dtype,
+        pv_dtype,
         out_dtype,
         head_dim,
         is_causal,
@@ -405,6 +415,7 @@ def cute_dsl_fmha_ragged_prefill(
         kernel_fn = get_cute_dsl_fmha_kernel(
             gpu_arch,
             q.dtype,
+            v.dtype,
             o.dtype,
             D,
             is_causal,
@@ -489,9 +500,10 @@ def cute_dsl_fmha_ragged_prefill(
         v_4d = v.unsqueeze(0)
         o_4d = o.unsqueeze(0)
 
-        is_fp8_in = q.dtype == torch.float8_e4m3fn
+        is_fp8_qk = q.dtype == torch.float8_e4m3fn
+        is_fp8_pv = v.dtype == torch.float8_e4m3fn
         is_fp8_out = o.dtype == torch.float8_e4m3fn
-        if is_fp8_in:
+        if is_fp8_qk:
             q_cute = from_dlpack(
                 q_4d.view(torch.int8), assumed_align=16
             ).mark_layout_dynamic(leading_dim=3)
@@ -500,10 +512,6 @@ def cute_dsl_fmha_ragged_prefill(
                 k_4d.view(torch.int8), assumed_align=16
             ).mark_layout_dynamic(leading_dim=3)
             k_cute.element_type = cutlass.Float8E4M3FN
-            v_cute = from_dlpack(
-                v_4d.view(torch.int8), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3)
-            v_cute.element_type = cutlass.Float8E4M3FN
         else:
             q_cute = from_dlpack(q_4d, assumed_align=16).mark_layout_dynamic(
                 leading_dim=3
@@ -511,6 +519,13 @@ def cute_dsl_fmha_ragged_prefill(
             k_cute = from_dlpack(k_4d, assumed_align=16).mark_layout_dynamic(
                 leading_dim=3
             )
+
+        if is_fp8_pv:
+            v_cute = from_dlpack(
+                v_4d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            v_cute.element_type = cutlass.Float8E4M3FN
+        else:
             v_cute = from_dlpack(v_4d, assumed_align=16).mark_layout_dynamic(
                 leading_dim=3
             )

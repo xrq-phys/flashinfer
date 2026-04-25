@@ -2021,6 +2021,176 @@ def test_trtllm_gen_prefill(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
+@pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("num_heads,num_heads_kv", [(4, 4), (16, 4)])
+@pytest.mark.parametrize(
+    "q_lens,kv_lens,causal",
+    [
+        pytest.param([1024], [1024], True, id="1024-causal"),
+        pytest.param([8192], [8192], False, id="8192-nomask"),
+        pytest.param([192, 256], [192, 256], False, id="192-256-nomask"),
+        pytest.param([1024, 256], [512, 256], False, id="1024-256-nomask"),
+        pytest.param([512, 512], [2048, 2048], False, id="512-512-nomask"),
+    ],
+)
+@pytest.mark.parametrize(
+    "qk_dtype,pv_dtype,out_dtype,atol,rtol",
+    [
+        pytest.param(
+            torch.float16, torch.float16, torch.float16, 1e-2, 1e-2, id="fp16"
+        ),
+        pytest.param(
+            torch.bfloat16, torch.bfloat16, torch.bfloat16, 1e-2, 1e-2, id="bf16"
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.bfloat16,
+            5e-2,
+            5e-2,
+            id="fp8-bf16",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.bfloat16,
+            5e-2,
+            5e-2,
+            id="bf16-fp8-bf16",
+        ),
+    ],
+)
+def test_cute_dsl_fmha_ragged_prefill(
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    atol: float,
+    rtol: float,
+    q_lens: list[int],
+    kv_lens: list[int],
+    num_heads: int,
+    num_heads_kv: int,
+    head_dim: int,
+    causal: bool,
+    skips_softmax: bool,
+) -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("This test is only guaranteed to work on SM100 and SM103 GPUs.")
+
+    from flashinfer.attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
+
+    seed = 0
+    torch.manual_seed(seed)
+    device = "cuda:0"
+    q_lens = torch.tensor(q_lens, dtype=torch.int32, device=device)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    total_q = int(q_lens.sum().item())
+    total_kv = int(kv_lens.sum().item())
+    max_qo_len = int(q_lens.max().item())
+    max_kv_len = int(kv_lens.max().item())
+
+    scale = 1.0 / math.sqrt(head_dim)
+    scale_q = 0.05 if qk_dtype == torch.float8_e4m3fn else 1.0
+    scale_k = 0.04 if qk_dtype == torch.float8_e4m3fn else 1.0
+    scale_v = 0.06 if pv_dtype == torch.float8_e4m3fn else 1.0
+    qk_ref_dtype = out_dtype if qk_dtype == torch.float8_e4m3fn else qk_dtype
+    pv_ref_dtype = qk_ref_dtype
+
+    def make_tensor(
+        max_len: int,
+        total_len: int,
+        num_heads_tensor: int,
+        dtype: torch.dtype,
+        ref_dtype: torch.dtype,
+        scale: float,
+    ):
+        tensor_f32 = (
+            torch.randn(
+                max_len + total_len,
+                num_heads_tensor,
+                head_dim,
+                device=device,
+                dtype=torch.float32,
+            )
+            * 0.1
+        )
+        if dtype == torch.float8_e4m3fn:
+            tensor = (tensor_f32 / scale).to(dtype)
+            ref = (tensor.float() * scale).to(ref_dtype)
+        else:
+            tensor = tensor_f32.to(dtype)
+            ref = tensor.to(ref_dtype)
+        return tensor[max_len:], ref[max_len:]
+
+    q, q_ref = make_tensor(
+        max_qo_len, total_q, num_heads, qk_dtype, qk_ref_dtype, scale_q
+    )
+    k_cache, k_ref = make_tensor(
+        max_kv_len, total_kv, num_heads_kv, qk_dtype, qk_ref_dtype, scale_k
+    )
+    v_cache, v_ref = make_tensor(
+        max_kv_len, total_kv, num_heads_kv, pv_dtype, pv_ref_dtype, scale_v
+    )
+    output_full = torch.empty(
+        max_qo_len + total_q,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=out_dtype,
+    )
+    output = output_full[max_qo_len:]
+
+    qo_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
+    )
+    kv_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), kv_lens.cumsum(0).int()]
+    )
+
+    _, workspace_buffer_ref = create_workspace_buffers(device)
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer_ref,
+        kv_layout="NHD",
+        backend="cutlass",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_heads,
+        num_heads_kv,
+        head_dim,
+        head_dim_vo=head_dim,
+        causal=causal,
+        sm_scale=scale,
+        q_data_type=q_ref.dtype,
+        kv_data_type=k_ref.dtype,
+    )
+    output_ref = wrapper.run(q_ref, k_ref, v_ref)
+
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+    cute_dsl_fmha_ragged_prefill(
+        q,
+        k_cache,
+        v_cache,
+        output,
+        qo_indptr,
+        kv_indptr,
+        is_causal=causal,
+        sm_scale=scale,
+        scale_q=scale_q,
+        scale_k=scale_k,
+        scale_v=scale_v,
+        enable_tvm_ffi=True,
+        max_qo_len=max_qo_len,
+        max_kv_len=max_kv_len,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+
+    torch.testing.assert_close(output, output_ref, atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize("backend", ["cute-dsl"])
 @pytest.mark.parametrize(
     "mla_dimensions", [deepseek_mla_dimensions, smaller_mla_dimensions]
