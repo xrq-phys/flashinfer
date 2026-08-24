@@ -117,6 +117,7 @@ def compile_cute_dsl_fmha_kernel(
         mask_type=_mask_type(has_window_left or has_window_right),
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
+        rescale_threshold=2**-8 if enable_skip_softmax or pv.width <= 8 else 8.0,
         use_tma_store=False,  # varlen -> STG
     )
 
@@ -200,6 +201,11 @@ def compile_cute_dsl_fmha_kernel(
         None,
         stream_fake,
         use_pdl,
+        None,
+        None,
+        None,
+        None,
+        None,
         options="--enable-tvm-ffi --opt-level 2",
     )
 
@@ -246,6 +252,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
+        rescale_threshold=2**-8 if enable_skip_softmax or pv.width <= 8 else 8.0,
         use_tma_store=True,  # non-varlen
     )
 
