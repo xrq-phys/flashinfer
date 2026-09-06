@@ -200,6 +200,11 @@ def compile_cute_dsl_fmha_kernel(
         None,
         stream_fake,
         use_pdl,
+        None,
+        None,
+        None,
+        None,
+        None,
         options="--enable-tvm-ffi --opt-level 2",
     )
 

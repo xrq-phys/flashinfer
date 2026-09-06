@@ -370,6 +370,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         total_softmax_count: Optional[cute.Tensor],
         stream: cuda.CUstream,
         use_pdl: bool,
+        reserved_0=None,
+        reserved_1=None,
+        reserved_2=None,
+        reserved_3=None,
+        reserved_4=None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
